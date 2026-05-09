@@ -57,6 +57,12 @@ declare module "@mariozechner/pi-coding-agent" {
 					id: string;
 					name: string;
 					reasoning: boolean;
+					thinkingLevelMap?: Partial<
+						Record<
+							"off" | "minimal" | "low" | "medium" | "high" | "xhigh",
+							string | null
+						>
+					>;
 					input: ("text" | "image")[];
 					cost: {
 						input: number;

@@ -12,6 +12,7 @@ import {
 	isUsageUntouched,
 	parseCodexUsageResponse,
 	pickBestAccount,
+	type ThinkingLevelMap,
 } from "./index";
 
 describe("isQuotaErrorMessage", () => {
@@ -42,15 +43,21 @@ describe("getOpenAICodexMirror", () => {
 		const sourceModels = getModels("openai-codex");
 		const expected = {
 			baseUrl: sourceModels[0]?.baseUrl || "https://chatgpt.com/backend-api",
-			models: sourceModels.map((m) => ({
-				id: m.id,
-				name: m.name,
-				reasoning: m.reasoning,
-				input: m.input,
-				cost: m.cost,
-				contextWindow: m.contextWindow,
-				maxTokens: m.maxTokens,
-			})),
+			models: sourceModels.map((m) => {
+				const thinkingLevelMap = (
+					m as typeof m & { thinkingLevelMap?: ThinkingLevelMap }
+				).thinkingLevelMap;
+				return {
+					id: m.id,
+					name: m.name,
+					reasoning: m.reasoning,
+					...(thinkingLevelMap !== undefined ? { thinkingLevelMap } : {}),
+					input: m.input,
+					cost: m.cost,
+					contextWindow: m.contextWindow,
+					maxTokens: m.maxTokens,
+				};
+			}),
 		};
 
 		expect(getOpenAICodexMirror()).toEqual(expected);

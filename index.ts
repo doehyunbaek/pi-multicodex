@@ -13,11 +13,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
-	loginOpenAICodex,
-	refreshOpenAICodexToken,
-	type OAuthCredentials,
-} from "@mariozechner/pi-ai/oauth";
-import {
 	type Api,
 	type AssistantMessage,
 	type AssistantMessageEvent,
@@ -29,6 +24,11 @@ import {
 	type Model,
 	type SimpleStreamOptions,
 } from "@mariozechner/pi-ai";
+import {
+	loginOpenAICodex,
+	type OAuthCredentials,
+	refreshOpenAICodexToken,
+} from "@mariozechner/pi-ai/oauth";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -100,10 +100,15 @@ type WhamUsageWindow = {
 	used_percent?: number;
 };
 
+export type ThinkingLevelMap = Partial<
+	Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh", string | null>
+>;
+
 export interface ProviderModelDef {
 	id: string;
 	name: string;
 	reasoning: boolean;
+	thinkingLevelMap?: ThinkingLevelMap;
 	input: ("text" | "image")[];
 	cost: {
 		input: number;
@@ -115,6 +120,11 @@ export interface ProviderModelDef {
 	maxTokens: number;
 }
 
+function getThinkingLevelMap(model: Model<Api>): ThinkingLevelMap | undefined {
+	return (model as Model<Api> & { thinkingLevelMap?: ThinkingLevelMap })
+		.thinkingLevelMap;
+}
+
 export function getOpenAICodexMirror(): {
 	baseUrl: string;
 	models: ProviderModelDef[];
@@ -122,15 +132,19 @@ export function getOpenAICodexMirror(): {
 	const sourceModels = getModels("openai-codex");
 	return {
 		baseUrl: sourceModels[0]?.baseUrl || "https://chatgpt.com/backend-api",
-		models: sourceModels.map((m) => ({
-			id: m.id,
-			name: m.name,
-			reasoning: m.reasoning,
-			input: m.input,
-			cost: m.cost,
-			contextWindow: m.contextWindow,
-			maxTokens: m.maxTokens,
-		})),
+		models: sourceModels.map((m) => {
+			const thinkingLevelMap = getThinkingLevelMap(m);
+			return {
+				id: m.id,
+				name: m.name,
+				reasoning: m.reasoning,
+				...(thinkingLevelMap !== undefined ? { thinkingLevelMap } : {}),
+				input: m.input,
+				cost: m.cost,
+				contextWindow: m.contextWindow,
+				maxTokens: m.maxTokens,
+			};
+		}),
 	};
 }
 
