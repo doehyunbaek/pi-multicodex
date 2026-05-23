@@ -1,8 +1,18 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { getModels } from "@mariozechner/pi-ai";
-import { describe, expect, it } from "vitest";
+import { refreshOpenAICodexToken } from "@mariozechner/pi-ai/oauth";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@mariozechner/pi-ai/oauth", () => ({
+	loginOpenAICodex: vi.fn(),
+	refreshOpenAICodexToken: vi.fn(),
+}));
+
 import {
 	type Account,
-	type AccountManager,
+	AccountManager,
 	buildMulticodexProviderConfig,
 	createStreamWrapper,
 	getNextResetAt,
@@ -93,6 +103,138 @@ type StreamWrapper = ReturnType<typeof createStreamWrapper>;
 type StreamModel = Parameters<StreamWrapper>[0];
 type StreamContext = Parameters<StreamWrapper>[1];
 type BaseProvider = Parameters<typeof createStreamWrapper>[1];
+type RefreshTokenResult = Awaited<ReturnType<typeof refreshOpenAICodexToken>>;
+const refreshTokenMock = vi.mocked(refreshOpenAICodexToken);
+
+describe("AccountManager token refresh", () => {
+	let tempDir: string;
+	let previousStorageFile: string | undefined;
+	let previousLogFile: string | undefined;
+	let previousLockDir: string | undefined;
+
+	beforeEach(() => {
+		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "multicodex-test-"));
+		previousStorageFile = process.env.MULTICODEX_STORAGE_FILE;
+		previousLogFile = process.env.MULTICODEX_LOG_FILE;
+		previousLockDir = process.env.MULTICODEX_LOCK_DIR;
+		process.env.MULTICODEX_STORAGE_FILE = path.join(tempDir, "accounts.json");
+		process.env.MULTICODEX_LOG_FILE = path.join(tempDir, "multicodex.log");
+		process.env.MULTICODEX_LOCK_DIR = path.join(tempDir, "locks");
+		refreshTokenMock.mockReset();
+	});
+
+	function restoreEnv(name: string, value: string | undefined): void {
+		if (value === undefined) {
+			delete process.env[name];
+		} else {
+			process.env[name] = value;
+		}
+	}
+
+	afterEach(() => {
+		restoreEnv("MULTICODEX_STORAGE_FILE", previousStorageFile);
+		restoreEnv("MULTICODEX_LOG_FILE", previousLogFile);
+		restoreEnv("MULTICODEX_LOCK_DIR", previousLockDir);
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("deduplicates concurrent refreshes for the same account", async () => {
+		const manager = new AccountManager();
+		manager.addOrUpdateAccount("a@example.com", {
+			access: "old-access",
+			refresh: "old-refresh",
+			expires: 0,
+			accountId: "acct-old",
+		});
+		const account = manager.getAccount("a@example.com");
+		expect(account).toBeDefined();
+
+		let resolveRefresh: (value: RefreshTokenResult) => void = () => {};
+		let markStarted: () => void = () => {};
+		const refreshResult = new Promise<RefreshTokenResult>((resolve) => {
+			resolveRefresh = resolve;
+		});
+		const refreshStarted = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		refreshTokenMock.mockImplementation(async () => {
+			markStarted();
+			return refreshResult;
+		});
+
+		const first = manager.ensureValidToken(account as Account);
+		await refreshStarted;
+		const second = manager.ensureValidToken(account as Account);
+
+		const expires = Date.now() + 60 * 60 * 1000;
+		resolveRefresh({
+			access: "new-access",
+			refresh: "new-refresh",
+			expires,
+			accountId: "acct-new",
+		});
+
+		await expect(Promise.all([first, second])).resolves.toEqual([
+			"new-access",
+			"new-access",
+		]);
+		expect(refreshTokenMock).toHaveBeenCalledTimes(1);
+		expect(refreshTokenMock).toHaveBeenCalledWith("old-refresh");
+		expect(account?.refreshToken).toBe("new-refresh");
+
+		const stored = JSON.parse(
+			fs.readFileSync(process.env.MULTICODEX_STORAGE_FILE || "", "utf-8"),
+		) as { accounts: Account[] };
+		expect(stored.accounts[0]?.refreshToken).toBe("new-refresh");
+		expect(stored.accounts[0]?.expiresAt).toBe(expires);
+	});
+
+	it("waits for a cross-manager refresh and reuses the saved rotated token", async () => {
+		const managerA = new AccountManager();
+		managerA.addOrUpdateAccount("a@example.com", {
+			access: "old-access",
+			refresh: "old-refresh",
+			expires: 0,
+			accountId: "acct-old",
+		});
+		const managerB = new AccountManager();
+		const accountA = managerA.getAccount("a@example.com");
+		const accountB = managerB.getAccount("a@example.com");
+		expect(accountA).toBeDefined();
+		expect(accountB).toBeDefined();
+
+		let resolveRefresh: (value: RefreshTokenResult) => void = () => {};
+		let markStarted: () => void = () => {};
+		const refreshResult = new Promise<RefreshTokenResult>((resolve) => {
+			resolveRefresh = resolve;
+		});
+		const refreshStarted = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		refreshTokenMock.mockImplementation(async () => {
+			markStarted();
+			return refreshResult;
+		});
+
+		const first = managerA.ensureValidToken(accountA as Account);
+		await refreshStarted;
+		const second = managerB.ensureValidToken(accountB as Account);
+
+		resolveRefresh({
+			access: "new-access",
+			refresh: "new-refresh",
+			expires: Date.now() + 60 * 60 * 1000,
+			accountId: "acct-new",
+		});
+
+		await expect(Promise.all([first, second])).resolves.toEqual([
+			"new-access",
+			"new-access",
+		]);
+		expect(refreshTokenMock).toHaveBeenCalledTimes(1);
+		expect(accountB?.refreshToken).toBe("new-refresh");
+	});
+});
 
 describe("usage helpers", () => {
 	it("parses usage response windows", () => {

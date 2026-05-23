@@ -9,6 +9,7 @@
  * module augmentation (pi-coding-agent.d.ts) so TypeScript can compile.
  */
 
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -41,6 +42,213 @@ import type {
 
 const USAGE_CACHE_TTL_MS = 5 * 60 * 1000;
 const USAGE_REQUEST_TIMEOUT_MS = 10 * 1000;
+const ACCESS_TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
+const TOKEN_REFRESH_LOCK_WAIT_MS = 60 * 1000;
+const TOKEN_REFRESH_LOCK_STALE_MS = 5 * 60 * 1000;
+const TOKEN_REFRESH_LOCK_POLL_MS = 250;
+const TOKEN_REFRESH_LOCK_DIR = path.join(
+	os.homedir(),
+	".pi",
+	"agent",
+	"multicodex-refresh-locks",
+);
+const LOG_FILE = path.join(os.homedir(), ".pi", "agent", "multicodex.log");
+
+function getMulticodexStorageFile(): string {
+	return process.env.MULTICODEX_STORAGE_FILE || STORAGE_FILE;
+}
+
+function getMulticodexLogFile(): string | undefined {
+	if (process.env.MULTICODEX_DISABLE_LOG === "1") return undefined;
+	return process.env.MULTICODEX_LOG_FILE || LOG_FILE;
+}
+
+function redactLogString(value: string): string {
+	return value.replace(
+		/(access_token|refresh_token|id_token|api[-_]?key|authorization|password|secret)(["'\s:=]+)([^"'\s,&}]+)/gi,
+		"$1$2[redacted]",
+	);
+}
+
+function safeLogJson(details: Record<string, unknown>): string {
+	const seen = new WeakSet<object>();
+	return JSON.stringify(details, (key, value: unknown) => {
+		if (/token|authorization|api[-_]?key|secret|password/i.test(key)) {
+			return "[redacted]";
+		}
+		if (value instanceof Error) {
+			return {
+				name: value.name,
+				message: redactLogString(value.message),
+				stack: value.stack ? redactLogString(value.stack) : undefined,
+			};
+		}
+		if (typeof value === "string") return redactLogString(value);
+		if (typeof value === "bigint") return value.toString();
+		if (typeof value === "object" && value !== null) {
+			if (seen.has(value)) return "[circular]";
+			seen.add(value);
+		}
+		return value;
+	});
+}
+
+function logMulticodex(
+	message: string,
+	details?: Record<string, unknown>,
+): void {
+	try {
+		const logFile = getMulticodexLogFile();
+		if (!logFile) return;
+		const dir = path.dirname(logFile);
+		if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+		const suffix = details ? ` ${safeLogJson(details)}` : "";
+		fs.appendFileSync(
+			logFile,
+			`${new Date().toISOString()} pid=${process.pid} ${message}${suffix}\n`,
+		);
+	} catch (error) {
+		console.error("Failed to write multicodex log:", error);
+	}
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getAccountLockId(email: string): string {
+	return crypto.createHash("sha256").update(email).digest("hex").slice(0, 16);
+}
+
+function getTokenRefreshLockDir(): string {
+	return process.env.MULTICODEX_LOCK_DIR || TOKEN_REFRESH_LOCK_DIR;
+}
+
+function getTokenRefreshLockPath(): string {
+	return path.join(getTokenRefreshLockDir(), "token-refresh.lock");
+}
+
+function getErrnoCode(error: unknown): string | undefined {
+	return typeof error === "object" && error !== null && "code" in error
+		? String((error as { code?: unknown }).code)
+		: undefined;
+}
+
+async function acquireTokenRefreshLock(email: string): Promise<() => void> {
+	const lockPath = getTokenRefreshLockPath();
+	const ownerFile = path.join(lockPath, "owner.json");
+	const lockId = getAccountLockId(email);
+	const ownerId = `${process.pid}:${Date.now()}:${crypto.randomUUID()}`;
+	const startedAt = Date.now();
+	let loggedWait = false;
+
+	while (true) {
+		try {
+			const lockDir = getTokenRefreshLockDir();
+			if (!fs.existsSync(lockDir)) {
+				fs.mkdirSync(lockDir, { recursive: true });
+			}
+			fs.mkdirSync(lockPath);
+			try {
+				fs.writeFileSync(
+					ownerFile,
+					JSON.stringify(
+						{ ownerId, pid: process.pid, lockId, email, createdAt: Date.now() },
+						null,
+						2,
+					),
+				);
+			} catch (error) {
+				fs.rmSync(lockPath, { recursive: true, force: true });
+				throw error;
+			}
+			logMulticodex("token.refresh.lock.acquired", {
+				email,
+				lockId,
+				waitMs: Date.now() - startedAt,
+			});
+
+			let released = false;
+			return () => {
+				if (released) return;
+				released = true;
+				try {
+					const stored = JSON.parse(fs.readFileSync(ownerFile, "utf-8")) as {
+						ownerId?: string;
+					};
+					if (stored.ownerId !== ownerId) {
+						logMulticodex("token.refresh.lock.release.skipped", {
+							email,
+							lockId,
+							reason: "owner_mismatch",
+						});
+						return;
+					}
+					fs.rmSync(lockPath, { recursive: true, force: true });
+					logMulticodex("token.refresh.lock.released", { email, lockId });
+				} catch (error) {
+					if (!fs.existsSync(lockPath)) {
+						logMulticodex("token.refresh.lock.release.missing", {
+							email,
+							lockId,
+						});
+						return;
+					}
+					logMulticodex("token.refresh.lock.release.failure", {
+						email,
+						lockId,
+						error,
+					});
+				}
+			};
+		} catch (error) {
+			if (getErrnoCode(error) !== "EEXIST") {
+				logMulticodex("token.refresh.lock.acquire.failure", {
+					email,
+					lockId,
+					error,
+				});
+				throw error;
+			}
+
+			let lockAgeMs = 0;
+			try {
+				lockAgeMs = Date.now() - fs.statSync(lockPath).mtimeMs;
+			} catch {
+				continue;
+			}
+
+			if (lockAgeMs > TOKEN_REFRESH_LOCK_STALE_MS) {
+				logMulticodex("token.refresh.lock.stale_removed", {
+					email,
+					lockId,
+					lockAgeMs,
+				});
+				fs.rmSync(lockPath, { recursive: true, force: true });
+				continue;
+			}
+
+			const waitedMs = Date.now() - startedAt;
+			if (waitedMs > TOKEN_REFRESH_LOCK_WAIT_MS) {
+				const timeoutError = new Error(
+					`Timed out waiting for token refresh lock for ${email}`,
+				);
+				logMulticodex("token.refresh.lock.timeout", {
+					email,
+					lockId,
+					waitedMs,
+				});
+				throw timeoutError;
+			}
+
+			if (!loggedWait) {
+				loggedWait = true;
+				logMulticodex("token.refresh.lock.wait", { email, lockId });
+			}
+			await sleep(TOKEN_REFRESH_LOCK_POLL_MS);
+		}
+	}
+}
 
 export function isQuotaErrorMessage(message: string): boolean {
 	return /\b429\b|quota|usage limit|rate.?limit|too many requests|limit reached/i.test(
@@ -410,6 +618,7 @@ export function pickBestAccount(
 export class AccountManager {
 	private data: StorageData;
 	private usageCache = new Map<string, CodexUsageSnapshot>();
+	private tokenRefreshes = new Map<string, Promise<string>>();
 	private warningHandler?: WarningHandler;
 	private manualEmail?: string;
 
@@ -419,24 +628,38 @@ export class AccountManager {
 
 	private load(): StorageData {
 		try {
-			if (fs.existsSync(STORAGE_FILE)) {
-				return JSON.parse(
-					fs.readFileSync(STORAGE_FILE, "utf-8"),
+			const storageFile = getMulticodexStorageFile();
+			if (fs.existsSync(storageFile)) {
+				const data = JSON.parse(
+					fs.readFileSync(storageFile, "utf-8"),
 				) as StorageData;
+				logMulticodex("storage.load.success", {
+					accounts: data.accounts?.length ?? 0,
+					activeEmail: data.activeEmail,
+				});
+				return data;
 			}
+			logMulticodex("storage.load.missing");
 		} catch (e) {
 			console.error("Failed to load multicodex accounts:", e);
+			logMulticodex("storage.load.failure", { error: e });
 		}
 		return { accounts: [] };
 	}
 
 	private save(): void {
 		try {
-			const dir = path.dirname(STORAGE_FILE);
+			const storageFile = getMulticodexStorageFile();
+			const dir = path.dirname(storageFile);
 			if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-			fs.writeFileSync(STORAGE_FILE, JSON.stringify(this.data, null, 2));
+			fs.writeFileSync(storageFile, JSON.stringify(this.data, null, 2));
+			logMulticodex("storage.save.success", {
+				accounts: this.data.accounts.length,
+				activeEmail: this.data.activeEmail,
+			});
 		} catch (e) {
 			console.error("Failed to save multicodex accounts:", e);
+			logMulticodex("storage.save.failure", { error: e });
 		}
 	}
 
@@ -456,6 +679,12 @@ export class AccountManager {
 		const existing = this.getAccount(email);
 		const accountId =
 			typeof creds.accountId === "string" ? creds.accountId : undefined;
+		logMulticodex("account.upsert.start", {
+			email,
+			existing: Boolean(existing),
+			hasAccountId: Boolean(accountId),
+			expiresAt: creds.expires,
+		});
 		if (existing) {
 			existing.accessToken = creds.access;
 			existing.refreshToken = creds.refresh;
@@ -473,7 +702,7 @@ export class AccountManager {
 			});
 		}
 		this.setActiveAccount(email);
-		this.save();
+		logMulticodex("account.upsert.success", { email });
 	}
 
 	getActiveAccount(): Account | undefined {
@@ -514,20 +743,31 @@ export class AccountManager {
 
 	setActiveAccount(email: string): void {
 		const account = this.getAccount(email);
-		if (!account) return;
+		if (!account) {
+			logMulticodex("account.active.missing", { email });
+			return;
+		}
 		this.data.activeEmail = email;
 		account.lastUsed = Date.now();
 		this.save();
+		logMulticodex("account.active.set", { email });
 	}
 
 	setManualAccount(email: string): void {
 		const account = this.getAccount(email);
-		if (!account) return;
+		if (!account) {
+			logMulticodex("account.manual.missing", { email });
+			return;
+		}
 		this.manualEmail = email;
 		account.lastUsed = Date.now();
+		logMulticodex("account.manual.set", { email });
 	}
 
 	clearManualAccount(): void {
+		if (this.manualEmail) {
+			logMulticodex("account.manual.clear", { email: this.manualEmail });
+		}
 		this.manualEmail = undefined;
 	}
 
@@ -536,6 +776,9 @@ export class AccountManager {
 		if (account) {
 			account.quotaExhaustedUntil = until;
 			this.save();
+			logMulticodex("account.quota.mark_exhausted", { email, until });
+		} else {
+			logMulticodex("account.quota.mark_exhausted_missing", { email, until });
 		}
 	}
 
@@ -558,13 +801,26 @@ export class AccountManager {
 		}
 
 		try {
+			logMulticodex("usage.refresh.start", {
+				email: account.email,
+				force: Boolean(options?.force),
+			});
 			const token = await this.ensureValidToken(account);
 			const usage = await fetchCodexUsage(token, account.accountId, {
 				signal: options?.signal,
 			});
 			this.usageCache.set(account.email, usage);
+			logMulticodex("usage.refresh.success", {
+				email: account.email,
+				primaryUsedPercent: usage.primary?.usedPercent,
+				secondaryUsedPercent: usage.secondary?.usedPercent,
+			});
 			return usage;
 		} catch (error) {
+			logMulticodex("usage.refresh.failure", {
+				email: account.email,
+				error,
+			});
 			this.warningHandler?.(
 				`Multicodex: failed to fetch usage for ${account.email}: ${getErrorMessage(
 					error,
@@ -579,9 +835,14 @@ export class AccountManager {
 		signal?: AbortSignal;
 	}): Promise<void> {
 		const accounts = this.getAccounts();
+		logMulticodex("usage.refresh_all.start", {
+			accounts: accounts.length,
+			force: Boolean(options?.force),
+		});
 		await Promise.all(
 			accounts.map((account) => this.refreshUsageForAccount(account, options)),
 		);
+		logMulticodex("usage.refresh_all.done", { accounts: accounts.length });
 	}
 
 	async refreshUsageIfStale(
@@ -616,6 +877,15 @@ export class AccountManager {
 		});
 		if (selected) {
 			this.setActiveAccount(selected.email);
+			logMulticodex("account.best.selected", {
+				email: selected.email,
+				excludedEmails: options?.excludeEmails?.size ?? 0,
+			});
+		} else {
+			logMulticodex("account.best.none", {
+				accounts: accounts.length,
+				excludedEmails: options?.excludeEmails?.size ?? 0,
+			});
 		}
 		return selected;
 	}
@@ -624,6 +894,7 @@ export class AccountManager {
 		account: Account,
 		options?: { signal?: AbortSignal },
 	): Promise<void> {
+		logMulticodex("quota.exceeded", { email: account.email });
 		const usage = await this.refreshUsageForAccount(account, {
 			force: true,
 			signal: options?.signal,
@@ -648,23 +919,116 @@ export class AccountManager {
 		}
 	}
 
+	private isAccessTokenFresh(account: Account): boolean {
+		return Date.now() < account.expiresAt - ACCESS_TOKEN_REFRESH_SKEW_MS;
+	}
+
+	private tryReloadFromDisk(): boolean {
+		try {
+			const storageFile = getMulticodexStorageFile();
+			if (!fs.existsSync(storageFile)) return false;
+			this.data = JSON.parse(
+				fs.readFileSync(storageFile, "utf-8"),
+			) as StorageData;
+			logMulticodex("storage.reload.success", {
+				accounts: this.data.accounts.length,
+				activeEmail: this.data.activeEmail,
+			});
+			return true;
+		} catch (error) {
+			logMulticodex("storage.reload.failure", { error });
+			return false;
+		}
+	}
+
+	private syncAccountFields(target: Account, source: Account): void {
+		target.email = source.email;
+		target.accessToken = source.accessToken;
+		target.refreshToken = source.refreshToken;
+		target.expiresAt = source.expiresAt;
+		target.accountId = source.accountId;
+		target.lastUsed = source.lastUsed;
+		target.quotaExhaustedUntil = source.quotaExhaustedUntil;
+	}
+
+	private getOrAttachAccount(account: Account): Account {
+		const current = this.getAccount(account.email);
+		if (current) return current;
+		this.data.accounts.push(account);
+		logMulticodex("account.attach_missing", { email: account.email });
+		return account;
+	}
+
+	private async refreshTokenWithLocks(account: Account): Promise<string> {
+		const releaseLock = await acquireTokenRefreshLock(account.email);
+		try {
+			this.tryReloadFromDisk();
+			const current = this.getOrAttachAccount(account);
+			if (current !== account) {
+				this.syncAccountFields(account, current);
+			}
+
+			if (this.isAccessTokenFresh(current)) {
+				logMulticodex("token.refresh.skip_after_lock", {
+					email: current.email,
+					expiresAt: current.expiresAt,
+				});
+				return current.accessToken;
+			}
+
+			logMulticodex("token.refresh.start", {
+				email: current.email,
+				expiresAt: current.expiresAt,
+			});
+			const result = await refreshOpenAICodexToken(current.refreshToken);
+			current.accessToken = result.access;
+			current.refreshToken = result.refresh;
+			current.expiresAt = result.expires;
+			const accountId =
+				typeof result.accountId === "string" ? result.accountId : undefined;
+			if (accountId) {
+				current.accountId = accountId;
+			}
+			this.save();
+			if (current !== account) {
+				this.syncAccountFields(account, current);
+			}
+			logMulticodex("token.refresh.success", {
+				email: current.email,
+				expiresAt: current.expiresAt,
+				hasAccountId: Boolean(current.accountId),
+			});
+			return current.accessToken;
+		} catch (error) {
+			logMulticodex("token.refresh.failure", {
+				email: account.email,
+				error,
+			});
+			throw error;
+		} finally {
+			releaseLock();
+		}
+	}
+
 	async ensureValidToken(account: Account): Promise<string> {
 		// Valid for at least 5 more mins
-		if (Date.now() < account.expiresAt - 5 * 60 * 1000) {
+		if (this.isAccessTokenFresh(account)) {
 			return account.accessToken;
 		}
 
-		const result = await refreshOpenAICodexToken(account.refreshToken);
-		account.accessToken = result.access;
-		account.refreshToken = result.refresh;
-		account.expiresAt = result.expires;
-		const accountId =
-			typeof result.accountId === "string" ? result.accountId : undefined;
-		if (accountId) {
-			account.accountId = accountId;
+		const inFlight = this.tokenRefreshes.get(account.email);
+		if (inFlight) {
+			logMulticodex("token.refresh.wait_in_process", {
+				email: account.email,
+			});
+			return inFlight;
 		}
-		this.save();
-		return account.accessToken;
+
+		const refresh = this.refreshTokenWithLocks(account).finally(() => {
+			this.tokenRefreshes.delete(account.email);
+		});
+		this.tokenRefreshes.set(account.email, refresh);
+		return refresh;
 	}
 }
 
@@ -887,6 +1251,12 @@ export function createStreamWrapper(
 		options?: SimpleStreamOptions,
 	): AssistantMessageEventStream => {
 		const stream = createAssistantMessageEventStream();
+		const requestId = crypto.randomUUID();
+		logMulticodex("stream.start", {
+			requestId,
+			model: model.id,
+			provider: model.provider,
+		});
 
 		(async () => {
 			try {
@@ -914,6 +1284,12 @@ export function createStreamWrapper(
 						);
 					}
 
+					logMulticodex("stream.account.selected", {
+						requestId,
+						email: account.email,
+						attempt,
+						manual: usingManual,
+					});
 					const token = await accountManager.ensureValidToken(account);
 
 					const abortController = createLinkedAbortController(options?.signal);
@@ -949,6 +1325,11 @@ export function createStreamWrapper(
 							const isQuota = isQuotaErrorMessage(msg);
 
 							if (isQuota && !forwardedAny && attempt < MAX_ROTATION_RETRIES) {
+								logMulticodex("stream.quota.retry", {
+									requestId,
+									email: account.email,
+									attempt,
+								});
 								await accountManager.handleQuotaExceeded(account, {
 									signal: options?.signal,
 								});
@@ -961,6 +1342,13 @@ export function createStreamWrapper(
 								break;
 							}
 
+							logMulticodex("stream.error", {
+								requestId,
+								email: account.email,
+								attempt,
+								isQuota,
+								message: msg,
+							});
 							stream.push(withProvider(event, model.provider));
 							stream.end();
 							return;
@@ -970,6 +1358,11 @@ export function createStreamWrapper(
 						stream.push(withProvider(event, model.provider));
 
 						if (event.type === "done") {
+							logMulticodex("stream.done", {
+								requestId,
+								email: account.email,
+								attempt,
+							});
 							stream.end();
 							return;
 						}
@@ -980,11 +1373,17 @@ export function createStreamWrapper(
 					}
 
 					// If inner finished without done/error, stop to avoid hanging.
+					logMulticodex("stream.inner_finished_without_terminal_event", {
+						requestId,
+						email: account.email,
+						attempt,
+					});
 					stream.end();
 					return;
 				}
 			} catch (e) {
 				const message = getErrorMessage(e);
+				logMulticodex("stream.failure", { requestId, error: e });
 				const errorEvent: AssistantMessageEvent = {
 					type: "error",
 					reason: "error",
