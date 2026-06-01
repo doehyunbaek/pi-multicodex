@@ -654,7 +654,10 @@ export class AccountManager {
 			if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 			fs.writeFileSync(storageFile, JSON.stringify(this.data, null, 2));
 			logMulticodex("storage.save.success", {
-				accounts: this.data.accounts.length,
+				accounts: this.data.accounts.map((account) => ({
+					email: account.email,
+					expiresAt: account.expiresAt,
+				})),
 				activeEmail: this.data.activeEmail,
 			});
 		} catch (e) {
@@ -750,7 +753,7 @@ export class AccountManager {
 		this.data.activeEmail = email;
 		account.lastUsed = Date.now();
 		this.save();
-		logMulticodex("account.active.set", { email });
+		// 		logMulticodex("account.active.set", { email });
 	}
 
 	setManualAccount(email: string): void {
@@ -801,20 +804,20 @@ export class AccountManager {
 		}
 
 		try {
-			logMulticodex("usage.refresh.start", {
-				email: account.email,
-				force: Boolean(options?.force),
-			});
+			// 			logMulticodex("usage.refresh.start", {
+			// 				email: account.email,
+			// 				force: Boolean(options?.force),
+			// 			});
 			const token = await this.ensureValidToken(account);
 			const usage = await fetchCodexUsage(token, account.accountId, {
 				signal: options?.signal,
 			});
 			this.usageCache.set(account.email, usage);
-			logMulticodex("usage.refresh.success", {
-				email: account.email,
-				primaryUsedPercent: usage.primary?.usedPercent,
-				secondaryUsedPercent: usage.secondary?.usedPercent,
-			});
+			// 			logMulticodex("usage.refresh.success", {
+			// 				email: account.email,
+			// 				primaryUsedPercent: usage.primary?.usedPercent,
+			// 				secondaryUsedPercent: usage.secondary?.usedPercent,
+			// 			});
 			return usage;
 		} catch (error) {
 			logMulticodex("usage.refresh.failure", {
@@ -835,14 +838,14 @@ export class AccountManager {
 		signal?: AbortSignal;
 	}): Promise<void> {
 		const accounts = this.getAccounts();
-		logMulticodex("usage.refresh_all.start", {
-			accounts: accounts.length,
-			force: Boolean(options?.force),
-		});
+		// 		logMulticodex("usage.refresh_all.start", {
+		// 			accounts: accounts.length,
+		// 			force: Boolean(options?.force),
+		// 		});
 		await Promise.all(
 			accounts.map((account) => this.refreshUsageForAccount(account, options)),
 		);
-		logMulticodex("usage.refresh_all.done", { accounts: accounts.length });
+		// 		logMulticodex("usage.refresh_all.done", { accounts: accounts.length });
 	}
 
 	async refreshUsageIfStale(
@@ -877,10 +880,10 @@ export class AccountManager {
 		});
 		if (selected) {
 			this.setActiveAccount(selected.email);
-			logMulticodex("account.best.selected", {
-				email: selected.email,
-				excludedEmails: options?.excludeEmails?.size ?? 0,
-			});
+			// 			logMulticodex("account.best.selected", {
+			// 				email: selected.email,
+			// 				excludedEmails: options?.excludeEmails?.size ?? 0,
+			// 			});
 		} else {
 			logMulticodex("account.best.none", {
 				accounts: accounts.length,
@@ -1252,11 +1255,11 @@ export function createStreamWrapper(
 	): AssistantMessageEventStream => {
 		const stream = createAssistantMessageEventStream();
 		const requestId = crypto.randomUUID();
-		logMulticodex("stream.start", {
-			requestId,
-			model: model.id,
-			provider: model.provider,
-		});
+		// 		logMulticodex("stream.start", {
+		// 			requestId,
+		// 			model: model.id,
+		// 			provider: model.provider,
+		// 		});
 
 		(async () => {
 			try {
@@ -1284,12 +1287,12 @@ export function createStreamWrapper(
 						);
 					}
 
-					logMulticodex("stream.account.selected", {
-						requestId,
-						email: account.email,
-						attempt,
-						manual: usingManual,
-					});
+					// 					logMulticodex("stream.account.selected", {
+					// 						requestId,
+					// 						email: account.email,
+					// 						attempt,
+					// 						manual: usingManual,
+					// 					});
 					const token = await accountManager.ensureValidToken(account);
 
 					const abortController = createLinkedAbortController(options?.signal);
@@ -1358,11 +1361,11 @@ export function createStreamWrapper(
 						stream.push(withProvider(event, model.provider));
 
 						if (event.type === "done") {
-							logMulticodex("stream.done", {
-								requestId,
-								email: account.email,
-								attempt,
-							});
+							// 							logMulticodex("stream.done", {
+							// 								requestId,
+							// 								email: account.email,
+							// 								attempt,
+							// 							});
 							stream.end();
 							return;
 						}
