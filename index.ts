@@ -1,8 +1,8 @@
 /*
  * MultiCodex Extension
  *
- * Rotates multiple ChatGPT Codex OAuth accounts for the built-in
- * openai-codex-responses API.
+ * Rotates multiple ChatGPT Codex OAuth accounts by exposing a dedicated
+ * MultiCodex API wrapper around Pi's built-in openai-codex-responses API.
  *
  * Note: The published @mariozechner/pi-coding-agent types do not expose the
  * extension surface yet. We import ExtensionAPI as a type and provide a local
@@ -477,18 +477,19 @@ function createTimeoutController(
 	};
 }
 
-function withProvider(
+function withModelIdentity(
 	event: AssistantMessageEvent,
 	provider: string,
+	api: Api,
 ): AssistantMessageEvent {
 	if ("partial" in event) {
-		return { ...event, partial: { ...event.partial, provider } };
+		return { ...event, partial: { ...event.partial, provider, api } };
 	}
 	if (event.type === "done") {
-		return { ...event, message: { ...event.message, provider } };
+		return { ...event, message: { ...event.message, provider, api } };
 	}
 	if (event.type === "error") {
-		return { ...event, error: { ...event.error, provider } };
+		return { ...event, error: { ...event.error, provider, api } };
 	}
 	return event;
 }
@@ -544,6 +545,9 @@ interface StorageData {
 
 const STORAGE_FILE = path.join(os.homedir(), ".pi", "agent", "multicodex.json");
 const PROVIDER_ID = "multicodex";
+const BASE_CODEX_API = "openai-codex-responses" as const;
+const MULTICODEX_API = "multicodex-codex-responses" as const;
+type MulticodexApi = typeof MULTICODEX_API;
 const QUOTA_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
 
 type WarningHandler = (message: string) => void;
@@ -1044,7 +1048,7 @@ type ApiProviderRef = NonNullable<ReturnType<typeof getApiProvider>>;
 export function buildMulticodexProviderConfig(accountManager: AccountManager): {
 	baseUrl: string;
 	apiKey: string;
-	api: "openai-codex-responses";
+	api: MulticodexApi;
 	streamSimple: (
 		model: Model<Api>,
 		context: Context,
@@ -1053,7 +1057,7 @@ export function buildMulticodexProviderConfig(accountManager: AccountManager): {
 	models: ProviderModelDef[];
 } {
 	const mirror = getOpenAICodexMirror();
-	const baseProvider = getApiProvider("openai-codex-responses");
+	const baseProvider = getApiProvider(BASE_CODEX_API);
 	if (!baseProvider) {
 		throw new Error(
 			"OpenAI Codex provider not available. Please update pi to include openai-codex support.",
@@ -1062,7 +1066,7 @@ export function buildMulticodexProviderConfig(accountManager: AccountManager): {
 	return {
 		baseUrl: mirror.baseUrl,
 		apiKey: "managed-by-extension",
-		api: "openai-codex-responses",
+		api: MULTICODEX_API,
 		streamSimple: createStreamWrapper(accountManager, baseProvider),
 		models: mirror.models,
 	};
@@ -1297,10 +1301,10 @@ export function createStreamWrapper(
 
 					const abortController = createLinkedAbortController(options?.signal);
 
-					const internalModel: Model<"openai-codex-responses"> = {
-						...(model as Model<"openai-codex-responses">),
+					const internalModel: Model<typeof BASE_CODEX_API> = {
+						...(model as Model<typeof BASE_CODEX_API>),
 						provider: "openai-codex",
-						api: "openai-codex-responses",
+						api: BASE_CODEX_API,
 					};
 
 					const inner = baseProvider.streamSimple(
@@ -1352,13 +1356,13 @@ export function createStreamWrapper(
 								isQuota,
 								message: msg,
 							});
-							stream.push(withProvider(event, model.provider));
+							stream.push(withModelIdentity(event, model.provider, model.api));
 							stream.end();
 							return;
 						}
 
 						forwardedAny = true;
-						stream.push(withProvider(event, model.provider));
+						stream.push(withModelIdentity(event, model.provider, model.api));
 
 						if (event.type === "done") {
 							// 							logMulticodex("stream.done", {
@@ -1395,7 +1399,7 @@ export function createStreamWrapper(
 						`Multicodex failed: ${message}`,
 					),
 				};
-				stream.push(withProvider(errorEvent, model.provider));
+				stream.push(withModelIdentity(errorEvent, model.provider, model.api));
 				stream.end();
 			}
 		})();

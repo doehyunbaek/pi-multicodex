@@ -81,7 +81,7 @@ describe("buildMulticodexProviderConfig", () => {
 			{} as unknown as AccountManager,
 		);
 
-		expect(config.api).toBe("openai-codex-responses");
+		expect(config.api).toBe("multicodex-codex-responses");
 		expect(config.apiKey).toBe("managed-by-extension");
 		expect(config.baseUrl).toBe(mirror.baseUrl);
 		expect(config.models).toEqual(mirror.models);
@@ -437,7 +437,7 @@ describe("manual account selection", () => {
 			{
 				id: "test",
 				provider: "multicodex",
-				api: "openai-codex-responses",
+				api: "multicodex-codex-responses",
 			} as StreamModel,
 			{} as StreamContext,
 		);
@@ -487,7 +487,7 @@ describe("manual account selection", () => {
 			{
 				id: "test",
 				provider: "multicodex",
-				api: "openai-codex-responses",
+				api: "multicodex-codex-responses",
 			} as StreamModel,
 			{} as StreamContext,
 		);
@@ -548,7 +548,7 @@ describe("manual account selection", () => {
 			{
 				id: "test",
 				provider: "multicodex",
-				api: "openai-codex-responses",
+				api: "multicodex-codex-responses",
 			} as StreamModel,
 			{} as StreamContext,
 		);
