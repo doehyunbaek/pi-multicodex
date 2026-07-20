@@ -25,16 +25,16 @@ import {
 	type Model,
 	type SimpleStreamOptions,
 } from "@mariozechner/pi-ai";
-import {
-	loginOpenAICodex,
-	type OAuthCredentials,
-	refreshOpenAICodexToken,
-} from "@mariozechner/pi-ai/oauth";
+import type { OAuthCredentials } from "@mariozechner/pi-ai/oauth";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
 } from "@mariozechner/pi-coding-agent";
+import {
+	loginOpenAICodex,
+	refreshOpenAICodexToken,
+} from "./openai-codex-oauth";
 
 // =============================================================================
 // Helpers

@@ -30,6 +30,7 @@
 	"author": "kim0",
 	"files": [
 		"index.ts",
+		"openai-codex-oauth.ts",
 		"README.md",
 		"LICENSE",
 		"assets/**"

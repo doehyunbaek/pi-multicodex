@@ -24,6 +24,7 @@ import {
 	pickBestAccount,
 	type ThinkingLevelMap,
 } from "./index";
+import { refreshOpenAICodexTokenFallback } from "./openai-codex-oauth";
 
 describe("isQuotaErrorMessage", () => {
 	it("matches 429", () => {
@@ -86,6 +87,58 @@ describe("buildMulticodexProviderConfig", () => {
 		expect(config.baseUrl).toBe(mirror.baseUrl);
 		expect(config.models).toEqual(mirror.models);
 		expect(typeof config.streamSimple).toBe("function");
+	});
+});
+
+describe("OpenAI Codex OAuth compatibility", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+		vi.unstubAllGlobals();
+	});
+
+	it("refreshes directly when the pi OAuth entry point has no runtime helpers", async () => {
+		vi.spyOn(Date, "now").mockReturnValue(1_000);
+		const payload = Buffer.from(
+			JSON.stringify({
+				"https://api.openai.com/auth": {
+					chatgpt_account_id: "acct-new",
+				},
+			}),
+		).toString("base64url");
+		const accessToken = `header.${payload}.signature`;
+		const fetchMock = vi.fn(
+			async (_input: string | URL | Request, _init?: RequestInit) =>
+				new Response(
+					JSON.stringify({
+						access_token: accessToken,
+						refresh_token: "rotated-refresh",
+						expires_in: 3600,
+					}),
+					{
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					},
+				),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(
+			refreshOpenAICodexTokenFallback("old-refresh"),
+		).resolves.toEqual({
+			access: accessToken,
+			refresh: "rotated-refresh",
+			expires: 3_601_000,
+			accountId: "acct-new",
+		});
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		const [url, init] = fetchMock.mock.calls[0] || [];
+		expect(url).toBe("https://auth.openai.com/oauth/token");
+		expect(init?.method).toBe("POST");
+		const body = init?.body as URLSearchParams;
+		expect(body.get("grant_type")).toBe("refresh_token");
+		expect(body.get("refresh_token")).toBe("old-refresh");
+		expect(body.get("client_id")).toBe("app_EMoamEEZ73f0CkXaXp7hrann");
 	});
 });
 

@@ -10,6 +10,7 @@
 	},
 	"include": [
 		"index.ts",
+		"openai-codex-oauth.ts",
 		"pi-coding-agent.d.ts",
 		"index.test.ts",
 		"vitest.config.ts"
